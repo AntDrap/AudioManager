@@ -6,7 +6,6 @@ using UnityEngine.Audio;
 using System.Reflection;
 
 
-
 #if UNITY_EDITOR
 using UnityEditor;
 using UnityEditor.UIElements;
@@ -18,11 +17,19 @@ using UnityEditor.UIElements;
 [CreateAssetMenu(fileName = nameof(AudioConfigObject), menuName = nameof(AudioConfigObject))]
 public class AudioConfigObject : ScriptableObject
 {
+    private static Dictionary<string, AudioClipHolder> audioDictionary;
+    private static Dictionary<string, float> defaultVolumeDictionary;
+
     private static AudioConfigObject _instance;
     public static AudioConfigObject instance
     {
         get
         {
+            if(!Application.isPlaying)
+            {
+                return Resources.Load<AudioConfigObject>(nameof(AudioConfigObject));
+            }
+
             if(_instance == null)
             {
                 _instance = Resources.Load<AudioConfigObject>(nameof(AudioConfigObject));
@@ -34,28 +41,84 @@ public class AudioConfigObject : ScriptableObject
     }
 
     public AudioMixer audioMixer;
-    public float defaultVolume;
 
-    public GameObject audioSourcePrefab;
+    [SerializeField, Range(0, 20)] private float maxDecibals = 5;
+    [SerializeField] private GameObject audioSourcePrefab;
+    [SerializeField] private List<DefaultVolume> defaultVolumes;
+    [SerializeField] private AudioClipHolder[] audioClips;
 
-    public enum MixerGroup { Effects, Music }
-
-    [SerializeField]
-    private AudioClipHolder[] audioClips;
-
-    private static Dictionary<string, AudioClipHolder> audioDictionary;
-
-    public static string GetGroupName(MixerGroup group)
+    [Serializable]
+    private struct DefaultVolume
     {
-        switch(group)
+        [HideInInspector]
+        public string name;
+        [Range(0,1)]
+        public float volume;
+    }
+
+/*    private void OnValidate()
+    {
+        List<DefaultVolume> volumes = new List<DefaultVolume>();
+        List<string> mixerGroups = GetMixerGroupNames();
+
+        foreach(DefaultVolume defaultVolume in defaultVolumes)
         {
-            case MixerGroup.Effects:
-                return "Effects";
-            case MixerGroup.Music:
-                return "Music";
-            default:
-                return "Master";
+            if(mixerGroups.Contains(defaultVolume.name))
+            {
+                mixerGroups.Remove(defaultVolume.name);
+                volumes.Add(defaultVolume);
+            }
         }
+
+        foreach (string group in mixerGroups)
+        {
+            volumes.Add(new DefaultVolume()
+            {
+                name = group,
+                volume = 0.625f
+            });
+        }
+
+        defaultVolumes = volumes;
+    }*/
+
+    public static float TranslateVolume(float volume)
+    {
+        float convertedValue = Mathf.Lerp(Mathf.Epsilon, 1 + (6 * (instance.maxDecibals / 20)), volume);
+        convertedValue = Mathf.Log10(convertedValue) * 20;
+
+        return convertedValue;
+    }
+
+    public static float GetDefaultVolume(string name)
+    {
+        if(defaultVolumeDictionary == null)
+        {
+            List<DefaultVolume> volumes = instance.defaultVolumes;
+            defaultVolumeDictionary = new Dictionary<string, float>();
+
+            foreach(DefaultVolume defaultVolume in volumes)
+            {
+                defaultVolumeDictionary.Add(defaultVolume.name, defaultVolume.volume);
+            }
+        }
+
+        return defaultVolumeDictionary[name];
+    }
+
+    public static List<string> GetMixerGroupNames()
+    {
+        List<string> list = new List<string>();
+
+        if(instance.audioMixer != null)
+        {
+            foreach (AudioMixerGroup audioMixerGroup in instance.audioMixer.FindMatchingGroups("Master"))
+            {
+                list.Add(audioMixerGroup.name);
+            }
+        }
+
+        return list;
     }
 
     /// <summary>
@@ -132,6 +195,7 @@ public class AudioConfigObject : ScriptableObject
 public class AudioClipHolder
 {
     public enum PlayMode { Basic, Overwrite, Wait }
+    public enum FadeMode { None, Percent, Time }
 
     public string clipName;
     [Range(0, 5)]
@@ -141,15 +205,14 @@ public class AudioClipHolder
     [Range(0, 2)]
     public float maxPitch = 1;
 
-    [Range(0, 1)]
-    public float fadeInPercent;
-    [Range(0, 1)]
-    public float fadeOutPercent;
+    public FadeMode fadeMode;
+    public float fadeIn;
+    public float fadeOut;
 
     public bool loop;
 
     public PlayMode playMode = PlayMode.Basic;
-    public AudioConfigObject.MixerGroup mixerGroup;
+    public string mixerGroup;
 
     [SerializeField]
     private AudioClip[] audioClips;
@@ -177,6 +240,49 @@ public class AudioClipHolder
 
         return UnityEngine.Random.Range(minPitch, maxPitch);
     }
+
+    public float GetClipTime(AudioClip clip)
+    {
+        return clip.length - (GetFadeInTime(clip) + GetFadeOutTime(clip));
+    }
+
+    public float GetFadeInTime(AudioClip clip)
+    {
+        switch(fadeMode)
+        {
+            case FadeMode.Percent:
+                return Mathf.Clamp(fadeIn, 0, 1) * clip.length;
+            case FadeMode.Time:
+                if(fadeIn > clip.length)
+                {
+                    return clip.length;
+                }
+
+                return fadeIn;
+        }
+
+        return 0;
+    }
+
+    public float GetFadeOutTime(AudioClip clip)
+    {
+        switch (fadeMode)
+        {
+            case FadeMode.Percent:
+                return Mathf.Clamp(fadeOut, 0, (1 - fadeIn)) * clip.length;
+            case FadeMode.Time:
+                if (fadeIn + fadeOut > clip.length)
+                {
+                    return Mathf.Clamp(clip.length - fadeIn, 0, clip.length);
+                }
+                else
+                {
+                    return fadeIn;
+                }
+        }
+
+        return 0;
+    }
 }
 
 #if UNITY_EDITOR
@@ -184,8 +290,6 @@ public class AudioClipHolder
 [CustomPropertyDrawer(typeof(AudioClipHolder))]
 public class AudioClipHolderDrawer : PropertyDrawer
 {
-    private float prevFadeIn;
-
     public override VisualElement CreatePropertyGUI(SerializedProperty property)
     {
         VisualElement container = new VisualElement();
@@ -248,30 +352,50 @@ public class AudioClipHolderDrawer : PropertyDrawer
 
         container.Add(playclip);
 
+        List<string> groups = AudioConfigObject.GetMixerGroupNames();
+
+        if(groups.Count > 0)
+        {
+            SerializedProperty mixerGroup = property.FindPropertyRelative("mixerGroup");
+
+            if (!groups.Contains(mixerGroup.stringValue))
+            {
+                mixerGroup.stringValue = groups[0];
+                property.serializedObject.ApplyModifiedProperties();
+            }
+
+            DropdownField dropdown = new DropdownField(groups, groups.IndexOf(mixerGroup.stringValue));
+            dropdown.label = "Mixer Group";
+
+            dropdown.RegisterValueChangedCallback(evt =>
+            {
+                mixerGroup.stringValue = evt.newValue;
+                property.serializedObject.ApplyModifiedProperties();
+            });
+
+            fold.Add(dropdown);
+        }
+        else
+        {
+            fold.Add(new Label("No Audio Mixer / No Audio Mixer Groups"));
+        }
+
+
+
         fold.Add(new PropertyField(property.FindPropertyRelative("open")));
         fold.Add(new PropertyField(property.FindPropertyRelative("minPitch")));
         fold.Add(new PropertyField(property.FindPropertyRelative("maxPitch")));
         fold.Add(new PropertyField(property.FindPropertyRelative("playMode")));
-        fold.Add(new PropertyField(property.FindPropertyRelative("mixerGroup")));
 
-        fold.Add(new PropertyField(property.FindPropertyRelative("fadeInPercent")));
-        fold.Add(new PropertyField(property.FindPropertyRelative("fadeOutPercent")));
+
+        fold.Add(new PropertyField(property.FindPropertyRelative("loop")));
+
+        fold.Add(new PropertyField(property.FindPropertyRelative("fadeMode")));
+
+        fold.Add(new PropertyField(property.FindPropertyRelative("fadeIn")));
+        fold.Add(new PropertyField(property.FindPropertyRelative("fadeOut")));
 
         fold.Add(new PropertyField(property.FindPropertyRelative("audioClips")));
-
-        if(property.FindPropertyRelative("fadeInPercent").floatValue + property.FindPropertyRelative("fadeOutPercent").floatValue > 1)
-        {
-            if (property.FindPropertyRelative("fadeInPercent").floatValue > prevFadeIn)
-            {
-                property.FindPropertyRelative("fadeOutPercent").floatValue = 1 - property.FindPropertyRelative("fadeInPercent").floatValue;
-            }
-            else
-            {
-                property.FindPropertyRelative("fadeInPercent").floatValue = 1 - property.FindPropertyRelative("fadeOutPercent").floatValue;
-            }
-        }
-
-        prevFadeIn = property.FindPropertyRelative("fadeInPercent").floatValue;
 
         return container;
     }

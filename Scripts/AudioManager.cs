@@ -3,6 +3,9 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Audio;
+using UnityEngine.Rendering;
+using static Unity.VisualScripting.Member;
+using static UnityEngine.Rendering.DebugUI;
 using Random = UnityEngine.Random;
 
 public class AudioManager : MonoBehaviour
@@ -12,10 +15,28 @@ public class AudioManager : MonoBehaviour
     private static Dictionary<string, List<AudioSource>> playingClips = new Dictionary<string, List<AudioSource>>();
 
     private static Dictionary<string, AudioMixerGroup> mixerGroups = new Dictionary<string, AudioMixerGroup>();
-    private Dictionary<AudioSource, Coroutine> audioSourceCoroutine = new Dictionary<AudioSource, Coroutine>();
+    private Dictionary<AudioSource, AudioCoroutine> audioSourceCoroutine = new Dictionary<AudioSource, AudioCoroutine>();
 
     [SerializeField] private List<AudioSource> audioSourcePool = new List<AudioSource>();
     private int totalAudioCount;
+
+    private class AudioCoroutine
+    {
+        public float timeLeft;
+        public bool loop;
+
+        public AudioCoroutine(AudioClipHolder audioClipHolder, AudioClip audioClip)
+        {
+            this.timeLeft = audioClipHolder.GetClipTime(audioClip);
+            this.loop = audioClipHolder.loop;
+        }
+
+        public void StopCoroutine()
+        {
+            timeLeft = 0;
+            loop = false;
+        }
+    }
 
     private AudioSource GetSource()
     {
@@ -53,7 +74,6 @@ public class AudioManager : MonoBehaviour
 
         if (audioSourceCoroutine.ContainsKey(audioSource))
         {
-            StopCoroutine(audioSourceCoroutine[audioSource]);
             audioSourceCoroutine.Remove(audioSource);
         }
 
@@ -62,14 +82,16 @@ public class AudioManager : MonoBehaviour
 
     public static void Initialize()
     {
-        instance = new GameObject("AudioSourceHolder").AddComponent<AudioManager>();
+        GameObject audio = new GameObject("AudioSourceHolder");
+
+        instance = audio.AddComponent<AudioManager>();
 
         GameObject.DontDestroyOnLoad(instance);
 
         foreach (AudioMixerGroup audioMixerGroup in AudioConfigObject.instance.audioMixer.FindMatchingGroups("Master"))
         {
-            float soundValue = GetVolume(audioMixerGroup.name);
-            AudioConfigObject.instance.audioMixer.SetFloat(audioMixerGroup.name + "_Volume", soundValue);
+            float volume = GetVolume(audioMixerGroup.name);
+            AudioConfigObject.instance.audioMixer.SetFloat(audioMixerGroup.name + "_Volume", AudioConfigObject.TranslateVolume(volume));
             mixerGroups.Add(audioMixerGroup.name, audioMixerGroup);
         }
     }
@@ -78,24 +100,19 @@ public class AudioManager : MonoBehaviour
     {
         foreach (KeyValuePair<string, AudioMixerGroup> audioMixerGroups in mixerGroups)
         {
-            SetVolume(audioMixerGroups.Key, AudioConfigObject.instance.defaultVolume);
+            SetVolume(audioMixerGroups.Key, AudioConfigObject.GetDefaultVolume(audioMixerGroups.Key));
         }
     }
 
     public static float GetVolume(string groupName)
     {
-        return PlayerPrefs.GetFloat(groupName, AudioConfigObject.instance.defaultVolume);
+        return SaveManager.GetOptions().GetVolume(groupName);
     }
 
-    public static void SetVolume(string groupName, float value)
+    public static void SetVolume(string groupName, float volume)
     {
-        float convertedValue = Mathf.Lerp(0.00001f, 1.25f, value);
-        convertedValue = Mathf.Log10(convertedValue) * 20;
-
-        AudioConfigObject.instance.audioMixer.SetFloat(groupName, convertedValue);
-
-        PlayerPrefs.SetFloat(groupName, value);
-        PlayerPrefs.Save();
+        AudioConfigObject.instance.audioMixer.SetFloat(groupName + "_Volume", AudioConfigObject.TranslateVolume(volume));
+        SaveManager.GetOptions().SetVolume(groupName, volume);
     }
 
     private static List<AudioSource> GetPlayingSources(string clipName)
@@ -120,9 +137,13 @@ public class AudioManager : MonoBehaviour
 
         if(playingSources.Count > 0)
         {
-            foreach (AudioSource clip in playingSources)
+            foreach (AudioSource source in playingSources)
             {
-                instance.ReturnSource(clipName, clip);
+                if (instance.audioSourceCoroutine.ContainsKey(source))
+                {
+                    instance.audioSourceCoroutine[source].StopCoroutine();
+                    instance.audioSourceCoroutine.Remove(source);
+                }
             }
 
             return true;
@@ -168,13 +189,11 @@ public class AudioManager : MonoBehaviour
 
             source.clip = clip;
             source.pitch = pitchOverride >= 0 ? pitchOverride : clipHolder.GetPitch();
-            source.outputAudioMixerGroup = mixerGroups[AudioConfigObject.GetGroupName(clipHolder.mixerGroup)];
+            source.outputAudioMixerGroup = mixerGroups[clipHolder.mixerGroup];
 
             source.Play();
 
-            Coroutine coroutine = instance.StartCoroutine(SourceCoroutine(clipHolder, source, source.clip.length, Mathf.Log10(1 + (clipHolder.volumeScale * volumeOverride))));
-
-            instance.audioSourceCoroutine.Add(source,coroutine);
+            Coroutine coroutine = instance.StartCoroutine(SourceCoroutine(clipHolder, source, source.clip, Mathf.Log10(1 + (clipHolder.volumeScale * volumeOverride))));
 
             return source.clip.length;
         }
@@ -210,15 +229,21 @@ public class AudioManager : MonoBehaviour
         }
     }
 
-    private static IEnumerator SourceCoroutine(AudioClipHolder clipHolder, AudioSource audioSource, float length, float volume)
+    private static IEnumerator SourceCoroutine(AudioClipHolder clipHolder, AudioSource audioSource, AudioClip clip, float volume)
     {
-        if(clipHolder.fadeInPercent > 0)
+        AudioCoroutine audioCoroutine = new AudioCoroutine(clipHolder, clip);
+        instance.audioSourceCoroutine.Add(audioSource, audioCoroutine);
+
+        float fadeIn = clipHolder.GetFadeInTime(clip);
+        float fadeOut = clipHolder.GetFadeOutTime(clip);
+
+        if (fadeIn > 0)
         {
             float t = 0;
 
             while(t < 1)
             {
-                t += Time.deltaTime / (length * clipHolder.fadeInPercent);
+                t += Time.deltaTime / fadeIn;
                 audioSource.volume = Mathf.Lerp(0, volume, t);
 
                 yield return new WaitForEndOfFrame();
@@ -227,17 +252,24 @@ public class AudioManager : MonoBehaviour
 
         audioSource.volume = volume;
 
-        float waitTime = length * (1 - (clipHolder.fadeInPercent + clipHolder.fadeOutPercent));
+        while(audioCoroutine.timeLeft > 0)
+        {
+            audioCoroutine.timeLeft -= Time.deltaTime;
+            yield return new WaitForEndOfFrame();
+        }
 
-        yield return new WaitForSeconds(waitTime);
+        if(audioCoroutine.loop)
+        {
+            PlayClip(clipHolder.clipName);
+        }
 
-        if (clipHolder.fadeOutPercent > 0)
+        if (fadeOut > 0)
         {
             float t = 0;
 
             while (t < 1)
             {
-                t += Time.deltaTime / (length * clipHolder.fadeOutPercent);
+                t += Time.deltaTime / fadeOut;
                 audioSource.volume = Mathf.Lerp(volume, 0, t);
 
                 yield return new WaitForEndOfFrame();
