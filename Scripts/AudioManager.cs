@@ -106,13 +106,16 @@ public class AudioManager : MonoBehaviour
 
     public static float GetVolume(string groupName)
     {
-        return SaveManager.GetOptions().GetVolume(groupName);
+        Debug.LogWarning("Volume loading not set up");
+
+        return 1;
     }
 
     public static void SetVolume(string groupName, float volume)
     {
         AudioConfigObject.instance.audioMixer.SetFloat(groupName + "_Volume", AudioConfigObject.TranslateVolume(volume));
-        SaveManager.GetOptions().SetVolume(groupName, volume);
+
+        Debug.LogWarning("Volume saving not set up");
     }
 
     private static List<AudioSource> GetPlayingSources(string clipName)
