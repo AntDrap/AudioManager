@@ -1,12 +1,10 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using Unity.VisualScripting;
 using UnityEngine;
 using UnityEngine.Audio;
-using UnityEngine.Rendering;
 using static Unity.VisualScripting.Member;
-using static UnityEngine.Rendering.DebugUI;
-using Random = UnityEngine.Random;
 
 public class AudioManager : MonoBehaviour
 {
@@ -25,10 +23,14 @@ public class AudioManager : MonoBehaviour
         public float timeLeft;
         public bool loop;
 
-        public AudioCoroutine(AudioClipHolder audioClipHolder, AudioClip audioClip)
+        public AudioCoroutine(AudioClipHolder audioClipHolder)
         {
-            this.timeLeft = audioClipHolder.GetClipTime(audioClip);
             this.loop = audioClipHolder.loop;
+        }
+
+        public void SetTime(float time)
+        {
+            timeLeft = time;
         }
 
         public void StopCoroutine()
@@ -47,8 +49,6 @@ public class AudioManager : MonoBehaviour
 
         AudioSource source = audioSourcePool[0];
         audioSourcePool.RemoveAt(0);
-
-        source.gameObject.SetActive(true);
 
         return source;
     }
@@ -76,8 +76,6 @@ public class AudioManager : MonoBehaviour
         {
             audioSourceCoroutine.Remove(audioSource);
         }
-
-        audioSource.gameObject.SetActive(false);
     }
 
     public static void Initialize()
@@ -85,6 +83,7 @@ public class AudioManager : MonoBehaviour
         GameObject audio = new GameObject("AudioSourceHolder");
 
         instance = audio.AddComponent<AudioManager>();
+        instance.AddComponent<AudioListener>();
 
         GameObject.DontDestroyOnLoad(instance);
 
@@ -155,14 +154,14 @@ public class AudioManager : MonoBehaviour
         return false;
     }
 
-    private static IEnumerator WaitForClipToLoad(AudioClipHolder clipHolder, AudioClip clip, float volumeOverride, float pitchOverride)
+    private static IEnumerator WaitForClipToLoad(AudioClipHolder clipHolder, AudioClip clip, Func<float> volumeFunction)
     {
         clip.LoadAudioData();
         yield return new WaitUntil(() => clip.loadState == AudioDataLoadState.Loaded);
-        PlayClip(clipHolder, clip, volumeOverride );
+        PlayClip(clipHolder, clip, volumeFunction);
     }
 
-    private static float PlayClip(AudioClipHolder clipHolder, AudioClip clip, float volumeOverride = 1, float pitchOverride = -1)
+    private static float PlayClip(AudioClipHolder clipHolder, AudioClip clip, Func<float> volumeFunction)
     {
         try
         {
@@ -187,16 +186,11 @@ public class AudioManager : MonoBehaviour
             }
 
             AudioSource source = instance.GetSource();
+            source.clip = clipHolder.GetClip();
 
-            GetPlayingSources(clipHolder.clipName).Add(source);
+            playingSources.Add(source);
 
-            source.clip = clip;
-            source.pitch = pitchOverride >= 0 ? pitchOverride : clipHolder.GetPitch();
-            source.outputAudioMixerGroup = mixerGroups[clipHolder.mixerGroup];
-
-            source.Play();
-
-            Coroutine coroutine = instance.StartCoroutine(SourceCoroutine(clipHolder, source, source.clip, Mathf.Log10(1 + (clipHolder.volumeScale * volumeOverride))));
+            Coroutine coroutine = instance.StartCoroutine(SourceCoroutine(clipHolder, source, source.clip, volumeFunction));
 
             return source.clip.length;
         }
@@ -208,7 +202,7 @@ public class AudioManager : MonoBehaviour
         }
     }
 
-    public static float PlayClip(string clipName, float volumeOverride = 1, float pitchOverride = -1)
+    public static float PlayClip(string clipName, Func<float> volumeFunction = null)
     {
         try
         {
@@ -216,13 +210,23 @@ public class AudioManager : MonoBehaviour
 
             AudioClip clip = audio.GetClip();
 
+            if(volumeFunction == null)
+            {
+                volumeFunction = () => audio.volumeScale;
+            }
+            else
+            {
+                Func<float> prevFunc = volumeFunction;
+                volumeFunction = () => audio.volumeScale * prevFunc();
+            }
+
             if (clip.loadState != AudioDataLoadState.Loaded)
             {
-                instance.StartCoroutine(WaitForClipToLoad(audio, clip, volumeOverride, pitchOverride));
+                instance.StartCoroutine(WaitForClipToLoad(audio, clip, volumeFunction));
                 return clip.length + 0.25f;
             }
 
-            return PlayClip(audio, clip, volumeOverride, pitchOverride);          
+            return PlayClip(audio, clip, volumeFunction);
         }
         catch (Exception e)
         {
@@ -232,52 +236,63 @@ public class AudioManager : MonoBehaviour
         }
     }
 
-    private static IEnumerator SourceCoroutine(AudioClipHolder clipHolder, AudioSource audioSource, AudioClip clip, float volume)
+    private static IEnumerator SourceCoroutine(AudioClipHolder clipHolder, AudioSource audioSource, AudioClip clip, Func<float> volumeFunction)
     {
-        AudioCoroutine audioCoroutine = new AudioCoroutine(clipHolder, clip);
+        AudioCoroutine audioCoroutine = new AudioCoroutine(clipHolder);
         instance.audioSourceCoroutine.Add(audioSource, audioCoroutine);
 
-        float fadeIn = clipHolder.GetFadeInTime(clip);
-        float fadeOut = clipHolder.GetFadeOutTime(clip);
-
-        if (fadeIn > 0)
+        do
         {
-            float t = 0;
+            float fadeIn = clipHolder.GetFadeInTime(clip);
+            float fadeOut = clipHolder.GetFadeOutTime(clip);
 
-            while(t < 1)
+            audioSource.clip = clip;
+            audioSource.pitch = clipHolder.GetPitch();
+            audioSource.outputAudioMixerGroup = mixerGroups[clipHolder.mixerGroup];
+
+            audioCoroutine.SetTime(clipHolder.GetClipTime(clip));
+            audioSource.Play();
+
+            if (fadeIn > 0)
             {
-                t += Time.deltaTime / fadeIn;
-                audioSource.volume = Mathf.Lerp(0, volume, t);
+                float t = 0;
 
+                while (t < 1)
+                {
+                    t += Time.deltaTime / fadeIn;
+                    audioSource.volume = Mathf.Lerp(0, volumeFunction(), t);
+
+                    yield return new WaitForEndOfFrame();
+                }
+            }
+
+            audioSource.volume = volumeFunction();
+
+            while (audioCoroutine.timeLeft > 0)
+            {
+                audioCoroutine.timeLeft -= Time.deltaTime;
                 yield return new WaitForEndOfFrame();
             }
-        }
 
-        audioSource.volume = volume;
-
-        while(audioCoroutine.timeLeft > 0)
-        {
-            audioCoroutine.timeLeft -= Time.deltaTime;
-            yield return new WaitForEndOfFrame();
-        }
-
-        if(audioCoroutine.loop)
-        {
-            PlayClip(clipHolder.clipName);
-        }
-
-        if (fadeOut > 0)
-        {
-            float t = 0;
-
-            while (t < 1)
+            if (fadeOut > 0)
             {
-                t += Time.deltaTime / fadeOut;
-                audioSource.volume = Mathf.Lerp(volume, 0, t);
+                float t = 0;
 
-                yield return new WaitForEndOfFrame();
+                while (t < 1)
+                {
+                    t += Time.deltaTime / fadeOut;
+                    audioSource.volume = Mathf.Lerp(volumeFunction(), 0, t);
+
+                    yield return new WaitForEndOfFrame();
+                }
+            }
+
+            if (audioCoroutine.loop)
+            {
+                clip = clipHolder.GetClip();
             }
         }
+        while (audioCoroutine.loop);
 
         instance.ReturnSource(clipHolder.clipName, audioSource);
     }
